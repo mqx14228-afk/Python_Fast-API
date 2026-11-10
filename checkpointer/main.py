@@ -1,13 +1,18 @@
+# 搭建一条工作流，跑到 human_review 之前自动暂停、保存状态；
+# 外部通过接口发起审核，审核通过后恢复继续跑，拒绝就停住；
+# 用 thread_id 隔离不同会话状态。
+
 # Python 的静态类型检查，只在 IDE 中生效，运行时不强制校验
 # TypedDict 定义一个字典类型，用来给字典规定固定的键和类型
 # Literal 定义一个类型，只能取指定的值，限定变量只能取几个指定值
 from typing import TypedDict,Literal
 from fastapi import FastAPI
-from langgraph import StateGraph,START,END
+from langgraph.graph import StateGraph,START,END
 # 检查点中断 状态用 MemorySaver 保存到内存
-from langgraph.checkpointer.memory import MemorySaver
+from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel
 from langgraph.types import Command
+from typing import Any
 
 # Annotation.Root 
 # TypeDict 基类 作用是给字典规定固定的键和类型
@@ -54,6 +59,74 @@ builder.add_edge("node4",END)
 checkpointer = MemorySaver()
 
 graph = builder.compile(
+    # 检查点 标记中断并保存当前状态 便于恢复
     checkpointer=checkpointer,
+    # 在人工审核节点之前中断 interrupt 中断执行
     interrupt_before=["human_review"],
 )
+
+app = FastAPI(title="LangGraph Human-in-the-Loop Demo")
+
+# 用户输入 检验
+class ResumeRequest(BaseModel):
+    approved:bool
+
+# configurable thread_id 是会话唯一标识，配合 checkpointer 存取图状态，实现会话状态的保存和恢复、对话隔离
+def make_config(thread_id:str) -> dict:
+    return {
+        "configurable":{
+            # 会话唯一标识 不同的用户 会话状态 会不同
+            "thread_id":thread_id
+        }
+}
+
+# 启动工作流并暂停在审核前
+@app.post("/start")
+def start_workflow(thread_id:str = "demo-thread-001"):
+    config = make_config(thread_id)
+    # result 是 LangGraph 图执行结束后返回的最终字典状态，包含节点输出与更新后的状态
+    # invoke 之后 result 会包含暂停节点的信息
+    result = graph.invoke({"step":0,"msg":""},config)
+    print(result)
+    # snapshot 是随时可查的、带中断、下一个节点等控制信息的完整状态视图
+    snapshot = graph.get_state(config)
+    print(snapshot)
+    return {
+        "status":"interrupted",
+        "thread_id":thread_id,
+        "current_state":result,
+        "next_node":list[Any](snapshot.next),
+        "message":"流程已暂停，等待人工审核"
+    }
+
+@app.post("/resume")
+def resume_workflow(req:ResumeRequest,thread_id:str = "demo-thread-001"):
+    config = make_config(thread_id)
+    if not req.approved:
+        return {
+            "status":"rejected",
+            "thread_id":thread_id,
+            "message":"人工审核未通过，流程已经暂停"
+        }
+
+    # resume=True 从暂停节点继续执行 从 checkpointer 恢复状态继续执行
+    final_state = graph.invoke(Command(resume=True),config)
+    snapshot = graph.get_state(config)
+    return {
+        "status":"completed" if snapshot.next == 0 else "interrupted",
+        "thread_id":thread_id,
+        "final_state":final_state,
+        "next_node":list[Any](snapshot.next),
+        "message":"审核通过，流程继续执行"
+    }
+
+@app.get("/state")
+def get_state(thread_id:str = "demo-thread-001"):
+    config = make_config(thread_id)
+    snapshot = graph.get_state(config)
+    return {
+        "thread_id":thread_id,
+        "current_state":snapshot.values,
+        "config":snapshot.config,
+        "next_node":list[Any](snapshot.next),
+    }
