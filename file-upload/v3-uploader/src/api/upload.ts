@@ -2,7 +2,9 @@ import axios from "axios";
 
 // axios 全局配置实例
 const client = axios.create({
-    baseURL: "/api",
+    // baseURL: "/api",
+    // 直接访问后端接口 不走代理 会跨域报错
+    baseURL: "http://localhost:8000/api",
     timeout: 10000,
 });
 
